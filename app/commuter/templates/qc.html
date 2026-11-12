@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+{% block title %}线路时刻质检{% endblock %}
+{% block subtitle %}输入车次与按行驶顺序排列的站点，逐站翻页抓取，按服务日类型与停站顺序对齐，查超时、缺站与站序冲突。{% endblock %}
+{% block body %}
+  {% if errors %}
+  <div class="banner err">
+    <strong>⚠ 质检未能完成</strong>
+    <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <form method="post" novalidate>
+      <div class="grid">
+        <div class="full">
+          <label for="qc_home_url">时刻表首页 URL</label>
+          <input id="qc_home_url" name="qc_home_url" type="url" required
+                 placeholder="例如 http://example-site:5001/" value="{{ form.qc_home_url }}">
+        </div>
+        <div>
+          <label for="qc_trip_no">车次号</label>
+          <input id="qc_trip_no" name="qc_trip_no" required
+                 placeholder="例如 N302" value="{{ form.qc_trip_no }}">
+        </div>
+        <div></div>
+        <div>
+          <label for="qc_stations">站名（按行驶顺序，每行一个或用逗号分隔）</label>
+          <textarea id="qc_stations" name="qc_stations" required
+                    placeholder="滨河园区&#10;东门枢纽&#10;中央厂区&#10;夜班宿舍">{{ form.qc_stations }}</textarea>
+        </div>
+        <div>
+          <label for="qc_max_minutes">站间最长分钟数（与相邻站段一一对应）</label>
+          <textarea id="qc_max_minutes" name="qc_max_minutes" required
+                    placeholder="30&#10;50&#10;50">{{ form.qc_max_minutes }}</textarea>
+        </div>
+      </div>
+      <button type="submit">开始线路质检</button>
+      <p class="muted">
+        00:xx 与 24:xx 混写的跨午夜时刻会沿整条线路连续换算；
+        某站分页失败时，仅依赖该站的站段标为待核实，其余已确认异常照常列出，不会断言全线正常。
+      </p>
+    </form>
+  </div>
+
+  {% if qc_result and not errors %}
+  {% set confirmed = qc_result.confirmed_issues %}
+  {% set review = qc_result.review_issues %}
+
+  <div class="card">
+    {% if qc_result.line_normal %}
+    <div class="banner ok">
+      <strong>✅ 车次 {{ qc_result.trip_no }} 全线质检通过</strong>
+      <ul><li>各站分页完整，未发现超时、缺站或站序冲突。</li></ul>
+    </div>
+    {% else %}
+    <div class="banner {{ 'err' if confirmed else 'warn' }}">
+      <strong>
+        车次 {{ qc_result.trip_no }} 质检发现
+        {{ confirmed|length }} 项已确认异常、{{ review|length }} 项待核实
+        {% if qc_result.any_station_failed %}（含分页失败站点，不能断言全线正常）{% endif %}
+      </strong>
+      <ul>
+        {% for iss in qc_result.issues %}
+        <li>
+          <span class="tag {{ iss.status }}">
+            {{ iss.status == 'confirmed' and '已确认异常' or '待核实' }}
+          </span>
+          【{{ iss.segment }}】{{ iss.detail }}
+          {% if iss.sources %}
+            <br><span class="muted">来源：
+              {% for src in iss.sources %}<a href="{{ src }}" target="_blank">{{ src }}</a>{% if not loop.last %} ；{% endif %}{% endfor %}
+            </span>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <h2>各站分页抓取状态</h2>
+    <table>
+      <tr><th>行驶顺序</th><th>站名</th><th>抓取状态</th><th>来源 / 失败原因</th></tr>
+      {% for station in qc_result.stations %}
+      {% set st = qc_result.station_status[station] %}
+      <tr>
+        <td>第 {{ loop.index }} 站</td>
+        <td>{{ station }}</td>
+        <td>
+          {% if st.ok %}<span class="tag ok">分页完整</span>
+          {% else %}<span class="tag fail">抓取失败</span>{% endif %}
+        </td>
+        <td>
+          {% if st.url %}<a href="{{ st.url }}" target="_blank">{{ st.url }}</a>{% else %}—{% endif %}
+          {% if st.errors %}<div class="muted">{{ st.errors|join('；') }}</div>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <h2>问题清单（按线路位置排序）</h2>
+    <table>
+      <tr>
+        <th>状态</th><th>类型</th><th>服务日类型</th><th>站段/站点</th>
+        <th>说明</th><th>来源</th>
+      </tr>
+      {% for iss in qc_result.issues %}
+      <tr>
+        <td><span class="tag {{ iss.status }}">{{ iss.status == 'confirmed' and '已确认异常' or '待核实' }}</span></td>
+        <td>
+          {% if iss.kind == 'overtime' %}站间超时
+          {% elif iss.kind == 'missing_stop' %}缺站/缺时刻
+          {% elif iss.kind == 'seq_conflict' %}站序冲突
+          {% else %}记录待核实{% endif %}
+        </td>
+        <td>{{ iss.service_kind }}</td>
+        <td>{{ iss.segment }}</td>
+        <td>{{ iss.detail }}</td>
+        <td>
+          {% for src in iss.sources %}
+            <a href="{{ src }}" target="_blank">{{ src }}</a>{% if not loop.last %}<br>{% endif %}
+          {% else %}—{% endfor %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">未发现问题。</td></tr>
+      {% endfor %}
+    </table>
+
+    <h2>连续换算时刻轴（00:xx / 24:xx 混写已按始发服务日零点统一换算）</h2>
+    {% for kind, points in qc_result.timelines.items() %}
+    <h2 style="font-size:14px;color:var(--muted);">服务日类型：{{ service_labels[kind] }}</h2>
+    <table>
+      <tr>
+        <th>行驶顺序</th><th>站名</th><th>原始时刻</th><th>换算后时刻</th>
+        <th>停站顺序</th><th>备注</th><th>来源</th>
+      </tr>
+      {% for p in points %}
+      <tr>
+        <td>第 {{ loop.index }} 站</td>
+        <td>{{ p.station }}</td>
+        <td>{% if p.clock %}<code>{{ p.clock }}</code>{% else %}—{% endif %}</td>
+        <td>{{ p.elapsed|elapsed_label }}</td>
+        <td>{{ p.stop_seq if p.stop_seq is not none else '—' }}</td>
+        <td>{{ p.note or '' }}</td>
+        <td>{% if p.source_url %}<a href="{{ p.source_url }}" target="_blank">分页</a>{% else %}—{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endfor %}
+
+    <h2>站间耗时核算</h2>
+    <table>
+      <tr><th>站段</th><th>最长允许（分钟）</th><th>结论</th></tr>
+      {% for i in range(qc_result.stations|length - 1) %}
+      {% set seg = qc_result.stations[i] ~ ' → ' ~ qc_result.stations[i + 1] %}
+      {% set ns = namespace(found=false, hit=none, blocked=false, reason='') %}
+      {% for iss in qc_result.issues if iss.segment == seg and iss.kind == 'overtime' %}
+        {% set ns.found = true %}{% set ns.hit = iss %}
+      {% endfor %}
+      {# 站段任一端的时刻槽不可用（失败/缺站/歧义/时刻无法解析）时，不得断言未超限 #}
+      {% for points in qc_result.timelines.values() %}
+        {% for j in (i, i + 1) %}
+          {% if points[j].elapsed is none %}
+            {% set ns.blocked = true %}
+            {% set ns.reason = points[j].note %}
+          {% endif %}
+        {% endfor %}
+      {% endfor %}
+      <tr>
+        <td>{{ seg }}</td>
+        <td>{{ qc_result.max_minutes[i] }}</td>
+        <td>
+          {% if ns.found %}
+            <span class="tag {{ ns.hit.status }}">{{ ns.hit.status == 'confirmed' and '已确认异常' or '待核实' }}</span>
+            {{ ns.hit.detail }}
+          {% elif ns.blocked %}
+            <span class="tag review">待核实</span>
+            站段一端记录不可用（{{ ns.reason or '缺站或分页失败' }}），站间耗时无法核算
+          {% else %}<span class="tag ok">未超限</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endif %}
+{% endblock %}

@@ -1,54 +1,7 @@
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>夜班接驳车末班核定</title>
-  <style>
-    :root { --ink:#1f2933; --muted:#667085; --brand:#1d4ed8; --ok-bg:#ecfdf3;
-            --ok-bd:#12b76a; --warn-bg:#fffaeb; --warn-bd:#f79009;
-            --err-bg:#fef3f2; --err-bd:#f04438; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: "PingFang SC","Microsoft YaHei","Noto Sans CJK SC",
-           system-ui, sans-serif; color:var(--ink); background:#f5f7fb; }
-    header { background:var(--brand); color:#fff; padding:20px 28px; }
-    header h1 { margin:0; font-size:20px; }
-    header p { margin:6px 0 0; font-size:13px; opacity:.85; }
-    main { max-width:980px; margin:24px auto; padding:0 16px; }
-    .card { background:#fff; border:1px solid #e4e7ec; border-radius:10px;
-            padding:20px 24px; margin-bottom:20px; }
-    .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px 18px; }
-    .grid .full { grid-column: 1 / -1; }
-    label { display:block; font-size:13px; font-weight:600; margin-bottom:6px; }
-    input { width:100%; padding:9px 10px; border:1px solid #d0d5dd; border-radius:8px;
-            font-size:14px; }
-    input:focus { outline:2px solid #b2ccff; border-color:var(--brand); }
-    button { margin-top:16px; background:var(--brand); color:#fff; border:0;
-             padding:10px 26px; border-radius:8px; font-size:15px; cursor:pointer; }
-    button:hover { background:#1e40af; }
-    .banner { border-radius:8px; padding:12px 16px; margin-bottom:16px; font-size:14px;
-              border:1px solid; }
-    .banner.err { background:var(--err-bg); border-color:var(--err-bd); }
-    .banner.warn { background:var(--warn-bg); border-color:var(--warn-bd); }
-    .banner.ok { background:var(--ok-bg); border-color:var(--ok-bd); }
-    .banner ul { margin:6px 0 0 18px; padding:0; }
-    .answer { font-size:16px; line-height:1.9; }
-    .answer .trip { font-size:26px; font-weight:700; color:var(--brand); }
-    table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
-    th, td { border:1px solid #e4e7ec; padding:7px 9px; text-align:left; }
-    th { background:#f9fafb; }
-    code { background:#f2f4f7; padding:1px 6px; border-radius:4px; font-size:12px; }
-    .muted { color:var(--muted); font-size:12px; }
-    h2 { font-size:16px; margin:0 0 10px; }
-    a { color:var(--brand); word-break:break-all; }
-  </style>
-</head>
-<body>
-<header>
-  <h1>夜班接驳车末班核定</h1>
-  <p>输入两站与时间窗，自动翻页抓取两站时刻表，按车次号与停站顺序配对，给出还能准时到岗的最晚一班。</p>
-</header>
-<main>
+{% extends "base.html" %}
+{% block title %}夜班接驳车末班核定{% endblock %}
+{% block subtitle %}输入两站与时间窗，自动翻页抓取两站时刻表，按车次号与停站顺序配对，给出还能准时到岗的最晚一班。{% endblock %}
+{% block body %}
   {% if errors %}
   <div class="banner err">
     <strong>⚠ 无法核定末班</strong>
@@ -138,8 +91,4 @@
   {% elif request.method == 'POST' and not errors %}
   <div class="banner warn"><strong>未找到符合条件的班次。</strong></div>
   {% endif %}
-
-  <p class="muted">页面生成时间：{{ now }}</p>
-</main>
-</body>
-</html>
+{% endblock %}

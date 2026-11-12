@@ -165,6 +165,7 @@ def scrape_station_timetable(
                     station=cells[col["station"]].get_text(strip=True) or expected_station,
                     clock=cells[col["clock"]].get_text(strip=True),
                     service_kind=kind,
+                    source_url=url,
                 )
             )
 
@@ -177,3 +178,32 @@ def scrape_station_timetable(
     if chain_broken:
         errors.append("分页时刻表未完整抓取，无法核定末班，请稍后重试或联系调度。")
     return records, errors
+
+
+def fetch_station_for_qc(
+    home_url: str, station_name: str, session: requests.Session
+):
+    """供线路质检使用：定位站点并逐页抓取，返回 :class:`StationFetch`。
+
+    与末班核定不同，质检要求“某站失败不拖垮全线”，因此首页定位失败或
+    分页抓取失败都收敛为该站自身的错误列表，由调用方按站登记待核实，
+    而不是抛出异常中断整条线路的检查。
+    """
+    from .times import StationFetch
+
+    try:
+        first_url = find_station_url(home_url, station_name, session)
+    except (requests.RequestException, LookupError) as exc:
+        return StationFetch(
+            station=station_name,
+            records=[],
+            errors=[f"在首页定位站点「{station_name}」失败：{exc}"],
+            first_url=None,
+        )
+
+    records, errors = scrape_station_timetable(first_url, station_name, session)
+    # 质检按站独立呈现失败原因：去掉抓取器面向末班核定的泛化收尾句，避免重复
+    errors = [e for e in errors if not e.startswith("分页时刻表未完整抓取")]
+    return StationFetch(
+        station=station_name, records=records, errors=errors, first_url=first_url
+    )

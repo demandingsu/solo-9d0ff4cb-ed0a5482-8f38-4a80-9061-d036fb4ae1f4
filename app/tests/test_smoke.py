@@ -99,5 +99,79 @@ class SmokeTests(unittest.TestCase):
         self.assertIn("请填写", html)
 
 
+class QualityCheckSmokeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = _Server(example_app.app, 5052)
+        cls.server.start()
+        cls.base = "http://127.0.0.1:5052/"
+        requests.get(cls.base, timeout=5).raise_for_status()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.stop()
+
+    def _qc(self, trip_no, stations=None, minutes=None, **overrides):
+        payload = {
+            "qc_home_url": self.base,
+            "qc_trip_no": trip_no,
+            "qc_stations": stations or "滨河园区\n东门枢纽\n中央厂区\n夜班宿舍",
+            "qc_max_minutes": minutes or "30\n50\n50",
+        }
+        payload.update(overrides)
+        return commuter_app.test_client().post("/qc", data=payload)
+
+    def test_normal_trip_passes_with_mixed_clocks(self):
+        html = self._qc("N301").get_data(as_text=True)
+        self.assertIn("全线质检通过", html)
+        # 混写 00:45 被连续换算到次日
+        self.assertIn("次日 00:45", html)
+        self.assertIn("次日 01:20", html)
+
+    def test_overtime_trip_reports_confirmed_issue(self):
+        html = self._qc("N302").get_data(as_text=True)
+        self.assertIn("站间超时", html)
+        self.assertIn("已确认异常", html)
+        self.assertIn("70 分钟", html)
+        self.assertIn("中央厂区 → 夜班宿舍", html)
+
+    def test_missing_stop_trip(self):
+        html = self._qc("N303").get_data(as_text=True)
+        self.assertIn("缺站/缺时刻", html)
+        self.assertIn("中央厂区", html)
+
+    def test_seq_conflict_trip(self):
+        html = self._qc("N304").get_data(as_text=True)
+        self.assertIn("站序冲突", html)
+        self.assertIn("停站顺序为 3", html)
+
+    def test_ambiguous_trip_marks_review(self):
+        html = self._qc("N305").get_data(as_text=True)
+        self.assertIn("待核实", html)
+        self.assertIn("无法唯一对应", html)
+        # 歧义站相邻站段在耗时核算表中不得被标为“未超限”
+        self.assertIn("站间耗时无法核算", html)
+
+    def test_pagination_failure_keeps_other_confirmed_findings(self):
+        # 故障北站分页 500：依赖它的站段待核实，且页面不能断言全线正常
+        html = self._qc(
+            "X901",
+            stations="故障北站\n中央厂区",
+            minutes="120",
+        ).get_data(as_text=True)
+        self.assertIn("抓取失败", html)
+        self.assertIn("待核实", html)
+        self.assertNotIn("全线质检通过", html)
+
+    def test_qc_validation_errors(self):
+        client = commuter_app.test_client()
+        html = client.post("/qc", data={}).get_data(as_text=True)
+        self.assertIn("请填写", html)
+
+    def test_qc_unknown_trip(self):
+        html = self._qc("NO-SUCH-TRIP").get_data(as_text=True)
+        self.assertIn("均未找到车次", html)
+
+
 if __name__ == "__main__":
     unittest.main()

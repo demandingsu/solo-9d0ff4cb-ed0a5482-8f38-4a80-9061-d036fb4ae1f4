@@ -1,4 +1,4 @@
-"""夜班接驳车末班核定 Web 应用。"""
+"""夜班接驳车末班核定与线路时刻质检 Web 应用。"""
 
 from __future__ import annotations
 
@@ -7,10 +7,26 @@ from datetime import datetime
 import requests
 from flask import Flask, render_template, request
 
-from .scraper import find_station_url, scrape_station_timetable
-from .times import SERVICE_LABELS, determine_last_trip
+from .scraper import fetch_station_for_qc, find_station_url, scrape_station_timetable
+from .times import (
+    SERVICE_LABELS,
+    determine_last_trip,
+    check_line_timetable,
+)
 
 app = Flask(__name__)
+
+
+@app.template_filter("elapsed_label")
+def _elapsed_label(elapsed):
+    """把相对始发服务日零点的累计时长格式化为“当日/次日/第N日 HH:MM”。"""
+    if elapsed is None:
+        return "—"
+    total_minutes = int(elapsed.total_seconds() // 60)
+    day, minute_of_day = divmod(total_minutes, 24 * 60)
+    hour, minute = divmod(minute_of_day, 60)
+    prefix = "当日" if day == 0 else ("次日" if day == 1 else f"第{day + 1}日")
+    return f"{prefix} {hour:02d}:{minute:02d}"
 
 
 def _parse_local_dt(raw: str, field_label: str) -> datetime:
@@ -113,6 +129,80 @@ def index():
         determination=determination,
         board_source=board_source,
         alight_source=alight_source,
+        service_labels=SERVICE_LABELS,
+        now=datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+
+
+def _parse_lines(raw: str) -> list[str]:
+    """把文本域里按行/逗号/空白分隔的内容拆成条目列表（保留重复项与顺序）。"""
+    items: list[str] = []
+    for chunk in str(raw).replace("，", ",").replace(",", "\n").splitlines():
+        for piece in chunk.split():
+            piece = piece.strip()
+            if piece:
+                items.append(piece)
+    return items
+
+
+@app.route("/qc", methods=["GET", "POST"])
+def quality_check():
+    """线路时刻质检：逐站抓取分页，按服务日类型与停站顺序对齐整条线路。"""
+    form = {"qc_home_url": "", "qc_trip_no": "", "qc_stations": "", "qc_max_minutes": ""}
+    errors: list[str] = []
+    qc_result = None
+
+    if request.method == "POST":
+        form.update({key: request.form.get(key, "").strip() for key in form})
+
+        if not form["qc_home_url"]:
+            errors.append("请填写时刻表首页 URL。")
+        if not form["qc_trip_no"]:
+            errors.append("请填写要质检的车次号。")
+
+        stations = _parse_lines(form["qc_stations"])
+        if len(stations) < 2:
+            errors.append("请按行驶顺序填写至少两个站名（每行一个，或用逗号分隔）。")
+
+        minute_tokens = _parse_lines(form["qc_max_minutes"])
+        max_minutes: list[int] = []
+        for token in minute_tokens:
+            try:
+                value = int(token)
+            except ValueError:
+                errors.append(f"站间最长分钟数含非整数：「{token}」。")
+                break
+            if value <= 0:
+                errors.append(f"站间最长分钟数必须为正整数：「{token}」。")
+                break
+            max_minutes.append(value)
+        if not errors and stations and len(max_minutes) != len(stations) - 1:
+            errors.append(
+                f"站间最长分钟数应为 {len(stations) - 1} 个"
+                f"（{len(stations)} 个站有 {len(stations) - 1} 个站段），当前填了 {len(max_minutes)} 个。"
+            )
+
+        if not errors:
+            session = requests.Session()
+            fetches = [
+                fetch_station_for_qc(form["qc_home_url"], station, session)
+                for station in stations
+            ]
+            qc_result = check_line_timetable(
+                form["qc_trip_no"], stations, max_minutes, fetches
+            )
+            # 所有站都没抓到该车次的任何记录：给出明确阻断提示，但仍展示各站状态
+            if not qc_result.timelines:
+                errors.append(
+                    f"所有站点页面均未找到车次 {form['qc_trip_no']} 的记录，"
+                    f"请核对车次号与站名后重试。"
+                )
+
+    return render_template(
+        "qc.html",
+        form=form,
+        errors=errors,
+        qc_result=qc_result,
         service_labels=SERVICE_LABELS,
         now=datetime.now().strftime("%Y-%m-%d %H:%M"),
     )

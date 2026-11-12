@@ -62,6 +62,7 @@ class StopRecord:
     station: str
     clock: str          # 原始时刻文本，如 "24:30"
     service_kind: str   # weekday / weekend / daily
+    source_url: str | None = None  # 该记录所在分页 URL（质检报告溯源用）
 
     def clock_delta(self) -> timedelta | None:
         return parse_clock(self.clock)
@@ -206,4 +207,333 @@ def determine_last_trip(
 
     result.options.sort(key=lambda opt: opt.depart_dt, reverse=True)
     result.latest = result.options[0] if result.options else None
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 线路时刻质检：按服务日类型与停站顺序对齐整条线路，查超时 / 缺站 / 站序冲突
+# ---------------------------------------------------------------------------
+
+# 质检问题类型
+ISSUE_OVERTIME = "overtime"        # 站间耗时超限
+ISSUE_MISSING = "missing_stop"     # 缺站 / 缺时刻
+ISSUE_SEQ_CONFLICT = "seq_conflict"  # 站序冲突
+ISSUE_AMBIGUOUS = "ambiguous"      # 同站同服务日多条记录无法唯一对应
+ISSUE_TYPES = (ISSUE_OVERTIME, ISSUE_MISSING, ISSUE_SEQ_CONFLICT, ISSUE_AMBIGUOUS)
+
+# 问题可信级别：CONFIRMED 为已确认异常；REVIEW 为待核实（依赖失败分页或数据歧义）
+STATUS_CONFIRMED = "confirmed"
+STATUS_REVIEW = "review"
+
+ISSUE_LABELS = {
+    ISSUE_OVERTIME: "站间超时",
+    ISSUE_MISSING: "缺站/缺时刻",
+    ISSUE_SEQ_CONFLICT: "站序冲突",
+    ISSUE_AMBIGUOUS: "记录待核实",
+}
+STATUS_LABELS = {
+    STATUS_CONFIRMED: "已确认异常",
+    STATUS_REVIEW: "待核实",
+}
+
+
+@dataclass
+class StationFetch:
+    """某站分页抓取结果（由 Web 层调用抓取器后组装）。"""
+
+    station: str
+    records: list[StopRecord] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    first_url: str | None = None
+
+
+@dataclass
+class QCIssue:
+    """一条质检问题。"""
+
+    kind: str
+    status: str
+    service_kind: str
+    segment: str            # 涉及站段或站点的可读描述
+    detail: str             # 具体说明
+    sources: list[str] = field(default_factory=list)
+    order: int = 0          # 排序用：按线路位置
+
+
+@dataclass
+class TimePoint:
+    """对齐后的某站时刻点（按服务日类型分组）。"""
+
+    station: str
+    clock: str | None       # 原始时刻文本（保留 00:xx / 24:xx 混写）
+    elapsed: timedelta | None  # 相对始发服务日零点连续换算后的累计时长
+    day_offset: int | None     # 距始发服务日的天数（由混写/回卷换算得到）
+    stop_seq: int | None
+    source_url: str | None
+    note: str = ""          # 缺站/待核实/时刻无法解析等备注
+
+
+@dataclass
+class LineQCResult:
+    """整条线路对某一车次的质检结果。"""
+
+    trip_no: str
+    stations: list[str]
+    max_minutes: list[int]
+    issues: list[QCIssue] = field(default_factory=list)
+    # 每种服务日类型一张连续时刻轴：service_kind -> [TimePoint]
+    timelines: dict[str, list[TimePoint]] = field(default_factory=dict)
+    # 各站抓取状态：station -> {"ok": bool, "errors": [...], "url": str|None}
+    station_status: dict[str, dict] = field(default_factory=dict)
+
+    @property
+    def confirmed_issues(self) -> list[QCIssue]:
+        return [i for i in self.issues if i.status == STATUS_CONFIRMED]
+
+    @property
+    def review_issues(self) -> list[QCIssue]:
+        return [i for i in self.issues if i.status == STATUS_REVIEW]
+
+    @property
+    def any_station_failed(self) -> bool:
+        return any(not s["ok"] for s in self.station_status.values())
+
+    @property
+    def line_normal(self) -> bool:
+        """没有任何问题且所有站分页完整，才能断言全线正常。"""
+        return not self.issues and not self.any_station_failed
+
+
+def _segment_label(station_a: str, station_b: str) -> str:
+    return f"{station_a} → {station_b}"
+
+
+def check_line_timetable(
+    trip_no: str,
+    stations: list[str],
+    max_minutes: list[int],
+    fetches: list[StationFetch],
+) -> LineQCResult:
+    """对单个车次做整条线路的时刻质检（纯逻辑，不依赖网络）。
+
+    :param trip_no: 要质检的车次号
+    :param stations: 按行驶顺序排列的站名
+    :param max_minutes: 相邻站间最长允许分钟数，长度为 ``len(stations) - 1``
+    :param fetches: 与 ``stations`` 一一对应的各站抓取结果
+    :return: :class:`LineQCResult`，含问题清单、连续时刻轴与各站抓取状态
+
+    处理规则：
+      * 按服务日类型（工作日/周末/每日）分别对齐记录，服务日标注不一致的车次
+        会自然表现为某些服务日轴上的缺站；
+      * 00:xx / 24:xx 混写的时刻沿线路连续换算为“始发服务日零点 + 累计时长”，
+        后站累计时长不大于前站时按次日回卷（最多回卷一次，仍回卷不上记冲突）；
+      * 缺站、超时、站序冲突标为已确认异常；同站同服务日无法唯一对应、
+        依赖失败分页的站段标为待核实；
+      * 某站分页失败只影响依赖该站的结论，其余站确认的异常照常保留，
+        且本函数永不断言全线正常（由 :attr:`LineQCResult.line_normal` 体现）。
+    """
+    result = LineQCResult(trip_no=trip_no, stations=list(stations), max_minutes=list(max_minutes))
+
+    for fetch in fetches:
+        result.station_status[fetch.station] = {
+            "ok": not fetch.errors,
+            "errors": list(fetch.errors),
+            "url": fetch.first_url,
+        }
+
+    kinds_present = set()
+    # station_index -> service_kind -> 匹配该车次的记录列表
+    grouped: list[dict[str, list[StopRecord]]] = []
+    for fetch in fetches:
+        per_kind: dict[str, list[StopRecord]] = {}
+        for rec in fetch.records:
+            if rec.trip_no == trip_no:
+                per_kind.setdefault(rec.service_kind, []).append(rec)
+                kinds_present.add(rec.service_kind)
+        grouped.append(per_kind)
+
+    def add_issue(kind, status, kind_label, segment, detail, sources, order):
+        result.issues.append(
+            QCIssue(
+                kind=kind,
+                status=status,
+                service_kind=kind_label,
+                segment=segment,
+                detail=detail,
+                sources=list(dict.fromkeys(s for s in sources if s)),
+                order=order,
+            )
+        )
+
+    for service_kind in sorted(kinds_present):
+        kind_label = SERVICE_LABELS.get(service_kind, service_kind)
+        # 每站一个状态槽位，承载对齐后的时刻点与站段可用性
+        slots: list[TimePoint | None] = [None] * len(stations)
+        # seg_ok[i] 表示站段 stations[i] -> stations[i+1] 是否可判定
+        seg_ok = [True] * (len(stations) - 1)
+        last_elapsed: timedelta | None = None
+
+        for idx, station in enumerate(stations):
+            order = idx + 1
+            fetch = fetches[idx]
+            page_errors = list(fetch.errors)
+            page_url = fetch.first_url
+            failed = bool(page_errors)
+            matched = grouped[idx].get(service_kind, [])
+
+            if failed:
+                # 分页失败：依赖该站的相邻站段一律待核实，不臆造缺站结论
+                slots[idx] = TimePoint(
+                    station=station, clock=None, elapsed=None, day_offset=None,
+                    stop_seq=None, source_url=page_url,
+                    note="分页抓取失败，依赖本站的结果待核实",
+                )
+                if idx > 0:
+                    seg_ok[idx - 1] = False
+                if idx < len(seg_ok):
+                    seg_ok[idx] = False
+                add_issue(
+                    ISSUE_MISSING, STATUS_REVIEW, kind_label, station,
+                    f"「{station}」分页抓取失败，无法确认车次 {trip_no} 是否停靠本站及到发时刻"
+                    f"（{ '；'.join(page_errors) }）。",
+                    [page_url], order,
+                )
+                continue
+
+            if not matched:
+                slots[idx] = TimePoint(
+                    station=station, clock=None, elapsed=None, day_offset=None,
+                    stop_seq=None, source_url=page_url, note="缺站：未找到该车次记录",
+                )
+                if idx > 0:
+                    seg_ok[idx - 1] = False
+                if idx < len(seg_ok):
+                    seg_ok[idx] = False
+                add_issue(
+                    ISSUE_MISSING, STATUS_CONFIRMED, kind_label, station,
+                    f"车次 {trip_no}（{kind_label}）在「{station}」站时刻表中没有停站记录，判定为缺站。",
+                    [page_url], order,
+                )
+                continue
+
+            if len(matched) > 1:
+                # 同站同服务日无法唯一对应：标待核实，相邻站段不做超时断言
+                slots[idx] = TimePoint(
+                    station=station, clock=None, elapsed=None, day_offset=None,
+                    stop_seq=None,
+                    source_url=matched[0].source_url or page_url,
+                    note=f"待核实：同站同服务日存在 {len(matched)} 条记录",
+                )
+                if idx > 0:
+                    seg_ok[idx - 1] = False
+                if idx < len(seg_ok):
+                    seg_ok[idx] = False
+                clocks = "、".join(r.clock.strip() or "（无时刻）" for r in matched)
+                add_issue(
+                    ISSUE_AMBIGUOUS, STATUS_REVIEW, kind_label, station,
+                    f"车次 {trip_no}（{kind_label}）在「{station}」站有 {len(matched)} 条"
+                    f"同服务日记录（时刻 {clocks}），无法唯一对应，需人工核实。",
+                    [r.source_url or page_url for r in matched], order,
+                )
+                continue
+
+            rec = matched[0]
+            source = rec.source_url or page_url
+            delta = rec.clock_delta()
+            if delta is None:
+                slots[idx] = TimePoint(
+                    station=station, clock=rec.clock, elapsed=None, day_offset=None,
+                    stop_seq=rec.stop_seq, source_url=source,
+                    note="时刻无法解析，缺关键时刻",
+                )
+                if idx > 0:
+                    seg_ok[idx - 1] = False
+                if idx < len(seg_ok):
+                    seg_ok[idx] = False
+                add_issue(
+                    ISSUE_MISSING, STATUS_CONFIRMED, kind_label, station,
+                    f"车次 {trip_no}（{kind_label}）在「{station}」站的时刻"
+                    f"「{rec.clock or '（空）'}」无法解析，缺少有效到发时刻。",
+                    [source], order,
+                )
+                continue
+
+            # 连续换算：与前一有效时刻比较，00:xx 早于前站（如 24:40）时按次日回卷
+            elapsed = delta
+            day_offset = 0
+            if last_elapsed is not None and elapsed <= last_elapsed:
+                elapsed += timedelta(hours=24)
+            if last_elapsed is not None and elapsed <= last_elapsed:
+                add_issue(
+                    ISSUE_SEQ_CONFLICT, STATUS_CONFIRMED, kind_label, station,
+                    f"车次 {trip_no}（{kind_label}）在「{station}」站时刻「{rec.clock.strip()}」"
+                    f"按跨日回卷后仍不晚于前站时刻，时刻顺序矛盾。",
+                    [source], order,
+                )
+            if elapsed is not None:
+                day_offset = int(elapsed.total_seconds() // 86400)
+            slots[idx] = TimePoint(
+                station=station,
+                clock=rec.clock.strip(),
+                elapsed=elapsed,
+                day_offset=day_offset,
+                stop_seq=rec.stop_seq,
+                source_url=source,
+            )
+            last_elapsed = elapsed
+
+            # 停站顺序检查：缺失或与行驶顺序不一致都属站序冲突
+            if rec.stop_seq is None:
+                add_issue(
+                    ISSUE_SEQ_CONFLICT, STATUS_CONFIRMED, kind_label, station,
+                    f"车次 {trip_no}（{kind_label}）在「{station}」站缺少停站顺序，"
+                    f"无法核对站序。",
+                    [source], order,
+                )
+            elif rec.stop_seq != order:
+                add_issue(
+                    ISSUE_SEQ_CONFLICT, STATUS_CONFIRMED, kind_label, station,
+                    f"车次 {trip_no}（{kind_label}）在「{station}」站标注停站顺序为 "
+                    f"{rec.stop_seq}，与行驶顺序第 {order} 站不符。",
+                    [source], order,
+                )
+
+        result.timelines[service_kind] = slots
+
+        # 站间超时：仅当相邻两站时刻都有效、且站段可判定时才下结论
+        for i in range(len(stations) - 1):
+            left, right = slots[i], slots[i + 1]
+            segment = _segment_label(stations[i], stations[i + 1])
+            if not seg_ok[i]:
+                # 不重复造问题：失败/缺站/歧义本身已登记，这里只在尚未有任何
+                # 覆盖该站段的问题时补一条待核实说明
+                covered = any(
+                    iss.service_kind == kind_label
+                    and iss.order in (i + 1, i + 2)
+                    and iss.kind in (ISSUE_MISSING, ISSUE_AMBIGUOUS)
+                    for iss in result.issues
+                )
+                if not covered:
+                    add_issue(
+                        ISSUE_OVERTIME, STATUS_REVIEW, kind_label, segment,
+                        f"站段 {segment} 存在不可用记录，站间耗时无法核算，待核实。",
+                        [left.source_url if left else None,
+                         right.source_url if right else None],
+                        i + 1,
+                    )
+                continue
+            if left is None or right is None or left.elapsed is None or right.elapsed is None:
+                continue
+            minutes = int((right.elapsed - left.elapsed).total_seconds() // 60)
+            limit = max_minutes[i]
+            if minutes > limit:
+                add_issue(
+                    ISSUE_OVERTIME, STATUS_CONFIRMED, kind_label, segment,
+                    f"站段 {segment} 实际耗时 {minutes} 分钟"
+                    f"（{left.clock} → {right.clock}），超过最长允许 {limit} 分钟。",
+                    [left.source_url, right.source_url], i + 1,
+                )
+
+    # 排序：先按线路位置，再按问题类型，便于站务逐段核对
+    result.issues.sort(key=lambda iss: (iss.order, iss.kind, iss.service_kind))
     return result
